@@ -1,0 +1,2 @@
+best_val_acc,best_val_acc_epoch,best_val_loss,best_val_loss_epoch,final_train_loss,final_train_acc,final_val_loss,final_val_acc
+0.7167,99,1.3850066186904908,17,0.019378131945133208,0.99434,2.007784646511078,0.7122
