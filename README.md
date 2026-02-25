@@ -206,45 +206,6 @@ Note: these are repository snapshot runs and may use different hardware/process 
 | vgg19_tcl | 71.83 | 53 | 1.3042 |
 | vgg19_tcl12 | 67.48 | 158 | 1.4580 |
 
-## Publication-Friendly Reporting Checklist
 
-When preparing paper tables/appendix:
-- record the exact command line and git commit hash,
-- report `best_val_acc`, `best_val_acc_epoch`, and final metrics from `training_summary.csv`,
-- include `training_curves.png` and selected `training_log.csv` slices for convergence evidence,
-- if using DDP, report number of GPUs and `--dist-backend`,
-- if comparing QTCL settings, report ansatz, qubits, layers, shots, and alpha policy (fixed vs learnable).
 
-## Citation
-
-If you use this codebase, cite the SPIE MLCD paper and the repository.
-
-Paper citation (conference format):
-
-`<Author list from paper>`, "Quantum-based tensor contraction layers," in *Machine Learning from Challenging Data (MLCD)*, SPIE Defense + Commercial Sensing, 2026. Available: https://spie.org/ds/conferencedetails/machine-learning-from-challenging-data
-
-BibTeX (paper):
-
-```bibtex
-@inproceedings{qtcl_spie_mlcd_2026,
-  title     = {Quantum-based tensor contraction layers},
-  author    = {<Author list from paper>},
-  booktitle = {Machine Learning from Challenging Data (MLCD)},
-  year      = {2026},
-  publisher = {SPIE},
-  url       = {https://spie.org/ds/conferencedetails/machine-learning-from-challenging-data},
-  note      = {SPIE Defense + Commercial Sensing; update with DOI/paper number after SPIE Digital Library indexing}
-}
-```
-
-BibTeX (repository):
-
-```bibtex
-@misc{qtcl_repo,
-  title        = {QTCL: Quantum-based Tensor Contraction Layers},
-  author       = {QTCL Contributors},
-  year         = {2026},
-  howpublished = {\url{https://github.com/vantnprof/QTCL}},
-  note         = {Code for reproducing SPIE MLCD paper results}
-}
-```
+Contact information: vantn.prof@gmail.com
