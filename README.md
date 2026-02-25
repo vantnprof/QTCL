@@ -2,10 +2,19 @@
 
 PyTorch implementation of tensor-contraction classifiers and hybrid quantum-classical tensor-contraction classifiers for CIFAR-100.
 
+This repository is maintained to reproduce the experimental results reported in the SPIE MLCD paper **"Quantum-based tensor contraction layers"**.
+
 This repository includes:
 - classical Tensor Contraction Layers (TCL),
 - Quantum TCL (QTCL) with configurable quantum ansatz and mixing coefficient,
 - experiment pipelines for AlexNet and VGG19 with reproducible CSV/plot outputs.
+
+## Paper Scope
+
+- Paper title: *Quantum-based tensor contraction layers*
+- Venue: SPIE Defense + Commercial Sensing, *Machine Learning from Challenging Data (MLCD)*
+- Conference page: https://spie.org/ds/conferencedetails/machine-learning-from-challenging-data
+- Repository role: code and experiment scripts for reproducing the paper's AlexNet/VGG19 CIFAR-100 TCL/QTCL results
 
 ## Overview
 
@@ -206,16 +215,36 @@ When preparing paper tables/appendix:
 - if using DDP, report number of GPUs and `--dist-backend`,
 - if comparing QTCL settings, report ansatz, qubits, layers, shots, and alpha policy (fixed vs learnable).
 
-## Citation Template
+## Citation
 
-If you use this codebase in a manuscript, cite your corresponding paper and this repository. Replace placeholders below:
+If you use this codebase, cite the SPIE MLCD paper and the repository.
+
+Paper citation (conference format):
+
+`<Author list from paper>`, "Quantum-based tensor contraction layers," in *Machine Learning from Challenging Data (MLCD)*, SPIE Defense + Commercial Sensing, 2026. Available: https://spie.org/ds/conferencedetails/machine-learning-from-challenging-data
+
+BibTeX (paper):
+
+```bibtex
+@inproceedings{qtcl_spie_mlcd_2026,
+  title     = {Quantum-based tensor contraction layers},
+  author    = {<Author list from paper>},
+  booktitle = {Machine Learning from Challenging Data (MLCD)},
+  year      = {2026},
+  publisher = {SPIE},
+  url       = {https://spie.org/ds/conferencedetails/machine-learning-from-challenging-data},
+  note      = {SPIE Defense + Commercial Sensing; update with DOI/paper number after SPIE Digital Library indexing}
+}
+```
+
+BibTeX (repository):
 
 ```bibtex
 @misc{qtcl_repo,
   title        = {QTCL: Quantum-based Tensor Contraction Layers},
-  author       = {<Author List>},
-  year         = {<Year>},
-  howpublished = {\url{<Repository URL>}},
-  note         = {Code for AlexNet/VGG19 CIFAR-100 TCL and QTCL experiments}
+  author       = {QTCL Contributors},
+  year         = {2026},
+  howpublished = {\url{https://github.com/vantnprof/QTCL}},
+  note         = {Code for reproducing SPIE MLCD paper results}
 }
 ```
