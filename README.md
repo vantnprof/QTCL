@@ -178,11 +178,7 @@ Each run writes to `--output-dir`:
 - `training_summary.csv`: best/final metrics summary
 - `training_curves.png`: loss and accuracy curves
 - `checkpoint_best_acc.pth`: best validation-accuracy checkpoint
-
-For clean logs suitable for appendices:
-```bash
-python script/exp/alexnet_cifar100.py ... --no-progress 2>&1 | tee results/<exp_name>/log.txt
-```
+- `run.log`: real-time mirror of console output (written automatically by the script)
 
 ## Current Results Snapshot
 

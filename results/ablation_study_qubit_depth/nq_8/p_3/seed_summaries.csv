@@ -1,0 +1,2 @@
+seed,run_output_dir,best_val_acc,best_val_acc_epoch,best_val_loss,best_val_loss_epoch,final_train_loss,final_train_acc,final_val_loss,final_val_acc
+42,/work/vantn/QTCL/results/ablation_study_qubit_depth/nq_8/p_3,0.7151,33,2.266207424545288,36,0.01681634348564781,0.99462,2.8640431301116944,0.7132

@@ -7,7 +7,7 @@ import os
 import sys
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import matplotlib
 
@@ -22,8 +22,9 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, models, transforms
 from tqdm.auto import tqdm
-from src.tcl.tcl import TCL
+
 from src.qtcl.qtcl import QTCL
+from src.tcl.tcl import TCL
 
 
 class TeeStream:
@@ -72,35 +73,7 @@ def enable_run_log(output_dir: Path) -> Path:
     return run_log_path
 
 
-def replace_1st_fc_with_tcl(
-    model: nn.Module,
-    out_channels: int,
-    out_height: int,
-    out_width: int,
-    *,
-    debug: bool = False,
-) -> nn.Module:
-    if not hasattr(model, "classifier"):
-        raise ValueError("Model does not expose a classifier attribute.")
-    if not isinstance(model.classifier, nn.Sequential) or len(model.classifier) == 0:
-        raise ValueError("Model classifier must be a non-empty nn.Sequential.")
-
-    original_fc_params = sum(
-        p.numel()
-        for layer in model.classifier
-        if isinstance(layer, nn.Linear)
-        for p in layer.parameters()
-        if p.requires_grad
-    )
-
-    classifier = model.classifier
-    linear_indices = [idx for idx, layer in enumerate(classifier) if isinstance(layer, nn.Linear)]
-    if not linear_indices:
-        raise ValueError("Model classifier does not contain a linear layer to replace.")
-
-    first_linear_idx = linear_indices[0]
-    first_linear = classifier[first_linear_idx]
-
+def _resolve_avgpool_spatial_size(model: nn.Module) -> Tuple[int, int]:
     if not hasattr(model, "avgpool"):
         raise ValueError("Model does not expose an avgpool attribute.")
 
@@ -114,100 +87,77 @@ def replace_1st_fc_with_tcl(
 
     if in_height is None or in_width is None:
         raise ValueError("avgpool output size must resolve to concrete height and width.")
+    return int(in_height), int(in_width)
 
-    in_features = first_linear.in_features
-    if debug:
-        print(
-            "[replace_1st_fc_with_tcl] Detected first linear layer "
-            f"(index={first_linear_idx}) in_features={in_features}, out_features={first_linear.out_features}"
-        )
 
+def _require_linear_fc(model: nn.Module) -> nn.Linear:
+    if not hasattr(model, "fc"):
+        raise ValueError("Model does not expose an fc attribute.")
+    if not isinstance(model.fc, nn.Linear):
+        raise ValueError("Model fc must be an nn.Linear before replacement.")
+    return model.fc
+
+
+def _head_tracked_layers(model: nn.Module) -> Tuple[nn.Module, ...]:
+    return tuple(layer for layer in model.fc.modules() if isinstance(layer, (nn.Linear, TCL, QTCL)))
+
+
+def replace_1st_fc_with_tcl(
+    model: nn.Module,
+    out_channels: int,
+    out_height: int,
+    out_width: int,
+    *,
+    debug: bool = False,
+) -> nn.Module:
+    original_fc = _require_linear_fc(model)
+    original_fc_params = sum(p.numel() for p in original_fc.parameters() if p.requires_grad)
+
+    in_height, in_width = _resolve_avgpool_spatial_size(model)
     expected_product = in_height * in_width
-    if in_features % expected_product != 0:
-        raise ValueError("First linear layer in_features is not divisible by avgpool spatial size.")
+    if original_fc.in_features % expected_product != 0:
+        raise ValueError("fc in_features is not divisible by avgpool spatial size.")
 
-    in_channels = in_features // expected_product
-    if debug:
-        print(
-            "[replace_1st_fc_with_tcl] AvgPool spatial size "
-            f"({in_height}x{in_width}) -> inferred in_channels={in_channels}"
-        )
-
+    in_channels = original_fc.in_features // expected_product
     flattened_features = out_channels * out_height * out_width
-    if debug:
-        print(
-            "[replace_1st_fc_with_tcl] Target TCL output "
-            f"out_channels={out_channels}, out_height={out_height}, out_width={out_width}, "
-            f"flattened_features={flattened_features}"
-        )
-
-    prefix_layers = list(classifier[:first_linear_idx])
-    rest_layers = list(classifier[first_linear_idx + 1 :])
 
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
 
     if debug:
-        print("[replace_1st_fc_with_tcl] Original classifier:")
-        for idx, layer in enumerate(model.classifier):
-            print(f"  [{idx}]: {layer.__class__.__name__} -> {layer}")
+        print(
+            "[replace_1st_fc_with_tcl] ResNet head "
+            f"in_features={original_fc.in_features}, out_features={original_fc.out_features}, "
+            f"unflatten=({in_channels}, {in_height}, {in_width}), "
+            f"target=({out_channels}, {out_height}, {out_width})"
+        )
 
-    # Adjust the following linear layer to accept the new flattened size.
-    updated_linear = False
-    for idx, layer in enumerate(rest_layers):
-        if isinstance(layer, nn.Linear):
-            if debug:
-                print(
-                    "[replace_1st_fc_with_tcl] Adjusting next linear layer "
-                    f"from in_features={layer.in_features} to {flattened_features}"
-                )
-            rest_layers[idx] = nn.Linear(
-                flattened_features,
-                layer.out_features,
-                bias=layer.bias is not None,
-            ).to(device=device, dtype=dtype)
-            updated_linear = True
-            break
-    if not updated_linear:
-        raise ValueError("Could not locate the next linear layer in the classifier to adjust.")
-
-    bn_in = nn.BatchNorm2d(in_channels).to(device=device, dtype=dtype)
-    bn_out = nn.BatchNorm2d(out_channels).to(device=device, dtype=dtype)
-    tcl_layer = TCL(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        out_height=out_height,
-        out_width=out_width,
-    ).to(device=device, dtype=dtype)
-
-    new_classifier_layers = [
-        *prefix_layers,
+    model.fc = nn.Sequential(
         nn.Unflatten(1, (in_channels, in_height, in_width)),
-        bn_in,
-        tcl_layer,
-        bn_out,
+        nn.BatchNorm2d(in_channels).to(device=device, dtype=dtype),
+        TCL(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            out_height=out_height,
+            out_width=out_width,
+        ).to(device=device, dtype=dtype),
+        nn.BatchNorm2d(out_channels).to(device=device, dtype=dtype),
         nn.Flatten(),
-        *rest_layers,
-    ]
-    model.classifier = nn.Sequential(*new_classifier_layers)
-    if debug:
-        print("[replace_1st_fc_with_tcl] New classifier:")
-        for idx, layer in enumerate(model.classifier):
-            print(f"  [{idx}]: {layer.__class__.__name__} -> {layer}")
-
-    tracked_layers = tuple(
-        layer for layer in model.classifier if isinstance(layer, (nn.Linear, TCL, QTCL))
+        nn.Linear(
+            flattened_features,
+            original_fc.out_features,
+            bias=original_fc.bias is not None,
+        ).to(device=device, dtype=dtype),
     )
+
+    tracked_layers = _head_tracked_layers(model)
     modified_fc_params = sum(
         p.numel()
         for layer in tracked_layers
         for p in layer.parameters()
         if p.requires_grad
     )
-    if modified_fc_params <= 0 or original_fc_params <= 0:
-        space_saving = float("nan")
-    else:
-        space_saving = 1.0 - (modified_fc_params / original_fc_params)
+    space_saving = float("nan") if original_fc_params <= 0 else 1.0 - (modified_fc_params / original_fc_params)
 
     print(
         "[replace_1st_fc_with_tcl] Parameter comparison "
@@ -229,133 +179,62 @@ def replace_1st_2nd_fc_with_tcl(
     *,
     debug: bool = False,
 ) -> nn.Module:
-    if not hasattr(model, "classifier"):
-        raise ValueError("Model does not expose a classifier attribute.")
-    if not isinstance(model.classifier, nn.Sequential) or len(model.classifier) == 0:
-        raise ValueError("Model classifier must be a non-empty nn.Sequential.")
+    original_fc = _require_linear_fc(model)
+    original_fc_params = sum(p.numel() for p in original_fc.parameters() if p.requires_grad)
 
-    original_fc_params = sum(
-        p.numel()
-        for layer in model.classifier
-        if isinstance(layer, nn.Linear)
-        for p in layer.parameters()
-        if p.requires_grad
-    )
-
-    classifier = model.classifier
-    linear_indices = [idx for idx, layer in enumerate(classifier) if isinstance(layer, nn.Linear)]
-    if len(linear_indices) < 2:
-        raise ValueError("Model classifier must expose at least two linear layers.")
-
-    first_linear_idx, second_linear_idx = linear_indices[:2]
-    first_linear = classifier[first_linear_idx]
-
-    if not hasattr(model, "avgpool"):
-        raise ValueError("Model does not expose an avgpool attribute.")
-
-    output_size = getattr(model.avgpool, "output_size", None)
-    if output_size is None:
-        raise ValueError("Could not determine the output size of model.avgpool.")
-    if isinstance(output_size, int):
-        in_height, in_width = output_size, output_size
-    else:
-        in_height, in_width = output_size
-    if in_height is None or in_width is None:
-        raise ValueError("avgpool output size must resolve to concrete height and width.")
-
-    in_features = first_linear.in_features
+    in_height, in_width = _resolve_avgpool_spatial_size(model)
     expected_product = in_height * in_width
-    if in_features % expected_product != 0:
-        raise ValueError("First linear layer in_features is not divisible by avgpool spatial size.")
-    in_channels = in_features // expected_product
+    if original_fc.in_features % expected_product != 0:
+        raise ValueError("fc in_features is not divisible by avgpool spatial size.")
 
-    if debug:
-        print("[replace_1st_2nd_fc_with_tcl] Classifier layout before modification:")
-        for idx, layer in enumerate(classifier):
-            print(f"  [{idx}]: {layer.__class__.__name__} -> {layer}")
-        print(
-            "[replace_1st_2nd_fc_with_tcl] Resolved first linear in_features="
-            f"{in_features} (channels={in_channels}, height={in_height}, width={in_width})"
-        )
-
-    prefix_layers = list(classifier[:first_linear_idx])
-    between_layers = list(classifier[first_linear_idx + 1 : second_linear_idx])
-    tail_layers = list(classifier[second_linear_idx + 1 :])
+    in_channels = original_fc.in_features // expected_product
+    second_flattened = second_out_channels * second_out_height * second_out_width
 
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
 
-    second_flattened = second_out_channels * second_out_height * second_out_width
-
-    # Adjust the first linear layer after the replacements (originally third linear / classifier[-1]).
-    tail_linear_updated = False
-    for idx, layer in enumerate(tail_layers):
-        if isinstance(layer, nn.Linear):
-            if debug:
-                print(
-                    "[replace_1st_2nd_fc_with_tcl] Adjusting remaining linear layer "
-                    f"from in_features={layer.in_features} to {second_flattened}"
-                )
-            tail_layers[idx] = nn.Linear(
-                second_flattened,
-                layer.out_features,
-                bias=layer.bias is not None,
-            ).to(device=device, dtype=dtype)
-            tail_linear_updated = True
-            break
-    if not tail_linear_updated:
-        raise ValueError("Could not locate the final linear layer in the classifier to adjust.")
-
-    bn1_in = nn.BatchNorm2d(in_channels).to(device=device, dtype=dtype)
-    bn1_out = nn.BatchNorm2d(first_out_channels).to(device=device, dtype=dtype)
-    tcl1 = TCL(
-        in_channels=in_channels,
-        out_channels=first_out_channels,
-        out_height=first_out_height,
-        out_width=first_out_width,
-    ).to(device=device, dtype=dtype)
-
-    bn2_out = nn.BatchNorm2d(second_out_channels).to(device=device, dtype=dtype)
-    tcl2 = TCL(
-        in_channels=first_out_channels,
-        out_channels=second_out_channels,
-        out_height=second_out_height,
-        out_width=second_out_width,
-    ).to(device=device, dtype=dtype)
-
-    new_classifier_layers: List[nn.Module] = [*prefix_layers, nn.Unflatten(1, (in_channels, in_height, in_width))]
-    if bn1_in is not None:
-        new_classifier_layers.append(bn1_in)
-    new_classifier_layers.append(tcl1)
-    if bn1_out is not None:
-        new_classifier_layers.append(bn1_out)
-    new_classifier_layers.extend(between_layers)
-    new_classifier_layers.append(tcl2)
-    if bn2_out is not None:
-        new_classifier_layers.append(bn2_out)
-    new_classifier_layers.append(nn.Flatten())
-    new_classifier_layers.extend(tail_layers)
-
-    model.classifier = nn.Sequential(*new_classifier_layers)
-
     if debug:
-        print("[replace_1st_2nd_fc_with_tcl] Classifier layout after modification:")
-        for idx, layer in enumerate(model.classifier):
-            print(f"  [{idx}]: {layer.__class__.__name__} -> {layer}")
+        print(
+            "[replace_1st_2nd_fc_with_tcl] ResNet head "
+            f"in_features={original_fc.in_features}, out_features={original_fc.out_features}, "
+            f"unflatten=({in_channels}, {in_height}, {in_width}), "
+            f"first_target=({first_out_channels}, {first_out_height}, {first_out_width}), "
+            f"second_target=({second_out_channels}, {second_out_height}, {second_out_width})"
+        )
 
-    tracked_layers = tuple(
-        layer for layer in model.classifier if isinstance(layer, (nn.Linear, TCL, QTCL))
+    model.fc = nn.Sequential(
+        nn.Unflatten(1, (in_channels, in_height, in_width)),
+        nn.BatchNorm2d(in_channels).to(device=device, dtype=dtype),
+        TCL(
+            in_channels=in_channels,
+            out_channels=first_out_channels,
+            out_height=first_out_height,
+            out_width=first_out_width,
+        ).to(device=device, dtype=dtype),
+        nn.BatchNorm2d(first_out_channels).to(device=device, dtype=dtype),
+        TCL(
+            in_channels=first_out_channels,
+            out_channels=second_out_channels,
+            out_height=second_out_height,
+            out_width=second_out_width,
+        ).to(device=device, dtype=dtype),
+        nn.BatchNorm2d(second_out_channels).to(device=device, dtype=dtype),
+        nn.Flatten(),
+        nn.Linear(
+            second_flattened,
+            original_fc.out_features,
+            bias=original_fc.bias is not None,
+        ).to(device=device, dtype=dtype),
     )
+
+    tracked_layers = _head_tracked_layers(model)
     modified_fc_params = sum(
         p.numel()
         for layer in tracked_layers
         for p in layer.parameters()
         if p.requires_grad
     )
-    if modified_fc_params <= 0 or original_fc_params <= 0:
-        space_saving = float("nan")
-    else:
-        space_saving = 1.0 - (modified_fc_params / original_fc_params)
+    space_saving = float("nan") if original_fc_params <= 0 else 1.0 - (modified_fc_params / original_fc_params)
 
     print(
         "[replace_1st_2nd_fc_with_tcl] Parameter comparison "
@@ -376,126 +255,68 @@ def replace_1st_fc_with_qtcl(
     qmtl_kwargs: Optional[Dict[str, Any]] = None,
     debug: bool = False,
 ) -> nn.Module:
-    if not hasattr(model, "classifier"):
-        raise ValueError("Model does not expose a classifier attribute.")
-    if not isinstance(model.classifier, nn.Sequential) or len(model.classifier) == 0:
-        raise ValueError("Model classifier must be a non-empty nn.Sequential.")
+    original_fc = _require_linear_fc(model)
+    original_fc_params = sum(p.numel() for p in original_fc.parameters() if p.requires_grad)
 
-    original_fc_params = sum(
-        p.numel()
-        for layer in model.classifier
-        if isinstance(layer, nn.Linear)
-        for p in layer.parameters()
-        if p.requires_grad
-    )
-
-    classifier = model.classifier
-    linear_indices = [idx for idx, layer in enumerate(classifier) if isinstance(layer, nn.Linear)]
-    if not linear_indices:
-        raise ValueError("Model classifier does not contain a linear layer to replace.")
-
-    first_linear_idx = linear_indices[0]
-    first_layer = classifier[first_linear_idx]
-
-    if not hasattr(model, "avgpool"):
-        raise ValueError("Model does not expose an avgpool attribute.")
-
-    output_size = getattr(model.avgpool, "output_size", None)
-    if output_size is None:
-        raise ValueError("Could not determine the output size of model.avgpool.")
-    if isinstance(output_size, int):
-        in_height, in_width = output_size, output_size
-    else:
-        in_height, in_width = output_size
-
-    if in_height is None or in_width is None:
-        raise ValueError("avgpool output size must resolve to concrete height and width.")
-
-    in_features = first_layer.in_features
+    in_height, in_width = _resolve_avgpool_spatial_size(model)
     expected_product = in_height * in_width
-    if in_features % expected_product != 0:
-        raise ValueError("First linear layer in_features is not divisible by avgpool spatial size.")
+    if original_fc.in_features % expected_product != 0:
+        raise ValueError("fc in_features is not divisible by avgpool spatial size.")
 
-    in_channels = in_features // expected_product
+    in_channels = original_fc.in_features // expected_product
     flattened_features = out_channels * out_height * out_width
-
-    prefix_layers = list(classifier[:first_linear_idx])
-    rest_layers = list(classifier[first_linear_idx + 1 :])
 
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
 
     if debug:
-        print("[replace_1st_fc_with_qtcl] Original classifier:")
-        for idx, layer in enumerate(classifier):
-            print(f"  [{idx}]: {layer.__class__.__name__} -> {layer}")
-
-    updated_linear = False
-    for idx, layer in enumerate(rest_layers):
-        if isinstance(layer, nn.Linear):
-            if debug:
-                print(
-                    "[replace_1st_fc_with_qtcl] Adjusting next linear layer "
-                    f"from in_features={layer.in_features} to {flattened_features}"
-                )
-            rest_layers[idx] = nn.Linear(
-                flattened_features,
-                layer.out_features,
-                bias=layer.bias is not None,
-            ).to(device=device, dtype=dtype)
-            updated_linear = True
-            break
-    if not updated_linear:
-        raise ValueError("Could not locate the next linear layer in the classifier to adjust.")
-
-    if use_batchnorm:
-        bn_in: nn.Module = nn.BatchNorm2d(in_channels).to(device=device, dtype=dtype)
-        bn_out: nn.Module = nn.BatchNorm2d(out_channels).to(device=device, dtype=dtype)
-    else:
-        bn_in = nn.Identity()
-        bn_out = nn.Identity()
+        print(
+            "[replace_1st_fc_with_qtcl] ResNet head "
+            f"in_features={original_fc.in_features}, out_features={original_fc.out_features}, "
+            f"unflatten=({in_channels}, {in_height}, {in_width}), "
+            f"target=({out_channels}, {out_height}, {out_width})"
+        )
 
     q_kwargs: Dict[str, Any] = dict(qmtl_kwargs or {})
     for forbidden in ("in_channels", "out_channels", "out_height", "out_width"):
         q_kwargs.pop(forbidden, None)
 
-    qtcl_layer = QTCL(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        out_height=out_height,
-        out_width=out_width,
-        **q_kwargs,
-    ).to(device=device, dtype=dtype)
+    bn_in: nn.Module
+    bn_out: nn.Module
+    if use_batchnorm:
+        bn_in = nn.BatchNorm2d(in_channels).to(device=device, dtype=dtype)
+        bn_out = nn.BatchNorm2d(out_channels).to(device=device, dtype=dtype)
+    else:
+        bn_in = nn.Identity()
+        bn_out = nn.Identity()
 
-    new_classifier_layers = [
-        *prefix_layers,
+    model.fc = nn.Sequential(
         nn.Unflatten(1, (in_channels, in_height, in_width)),
         bn_in,
-        qtcl_layer,
+        QTCL(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            out_height=out_height,
+            out_width=out_width,
+            **q_kwargs,
+        ).to(device=device, dtype=dtype),
         bn_out,
         nn.Flatten(),
-        *rest_layers,
-    ]
-    model.classifier = nn.Sequential(*new_classifier_layers)
-
-    if debug:
-        print("[replace_1st_fc_with_qtcl] New classifier:")
-        for idx, layer in enumerate(model.classifier):
-            print(f"  [{idx}]: {layer.__class__.__name__} -> {layer}")
-
-    tracked_layers = tuple(
-        layer for layer in model.classifier if isinstance(layer, (nn.Linear, TCL, QTCL))
+        nn.Linear(
+            flattened_features,
+            original_fc.out_features,
+            bias=original_fc.bias is not None,
+        ).to(device=device, dtype=dtype),
     )
+
+    tracked_layers = _head_tracked_layers(model)
     modified_fc_params = sum(
         p.numel()
         for layer in tracked_layers
         for p in layer.parameters()
         if p.requires_grad
     )
-    if modified_fc_params <= 0 or original_fc_params <= 0:
-        space_saving = float("nan")
-    else:
-        space_saving = 1.0 - (modified_fc_params / original_fc_params)
+    space_saving = float("nan") if original_fc_params <= 0 else 1.0 - (modified_fc_params / original_fc_params)
 
     print(
         "[replace_1st_fc_with_qtcl] Parameter comparison "
@@ -520,81 +341,28 @@ def replace_1st_2nd_fc_with_qtcl(
     second_qmtl_kwargs: Optional[Dict[str, Any]] = None,
     debug: bool = False,
 ) -> nn.Module:
-    if not hasattr(model, "classifier"):
-        raise ValueError("Model does not expose a classifier attribute.")
-    if not isinstance(model.classifier, nn.Sequential) or len(model.classifier) == 0:
-        raise ValueError("Model classifier must be a non-empty nn.Sequential.")
+    original_fc = _require_linear_fc(model)
+    original_fc_params = sum(p.numel() for p in original_fc.parameters() if p.requires_grad)
 
-    original_fc_params = sum(
-        p.numel()
-        for layer in model.classifier
-        if isinstance(layer, nn.Linear)
-        for p in layer.parameters()
-        if p.requires_grad
-    )
-
-    classifier = model.classifier
-    linear_indices = [idx for idx, layer in enumerate(classifier) if isinstance(layer, nn.Linear)]
-    if len(linear_indices) < 2:
-        raise ValueError("Model classifier must expose at least two linear layers.")
-
-    first_linear_idx, second_linear_idx = linear_indices[:2]
-    first_linear = classifier[first_linear_idx]
-
-    if not hasattr(model, "avgpool"):
-        raise ValueError("Model does not expose an avgpool attribute.")
-
-    output_size = getattr(model.avgpool, "output_size", None)
-    if output_size is None:
-        raise ValueError("Could not determine the output size of model.avgpool.")
-    if isinstance(output_size, int):
-        in_height, in_width = output_size, output_size
-    else:
-        in_height, in_width = output_size
-    if in_height is None or in_width is None:
-        raise ValueError("avgpool output size must resolve to concrete height and width.")
-
-    in_features = first_linear.in_features
+    in_height, in_width = _resolve_avgpool_spatial_size(model)
     expected_product = in_height * in_width
-    if in_features % expected_product != 0:
-        raise ValueError("First linear layer in_features is not divisible by avgpool spatial size.")
-    in_channels = in_features // expected_product
+    if original_fc.in_features % expected_product != 0:
+        raise ValueError("fc in_features is not divisible by avgpool spatial size.")
 
-    if debug:
-        print("[replace_1st_2nd_fc_with_qtcl] Classifier layout before modification:")
-        for idx, layer in enumerate(classifier):
-            print(f"  [{idx}]: {layer.__class__.__name__} -> {layer}")
-
-    prefix_layers = list(classifier[:first_linear_idx])
-    between_layers = list(classifier[first_linear_idx + 1 : second_linear_idx])
-    tail_layers = list(classifier[second_linear_idx + 1 :])
+    in_channels = original_fc.in_features // expected_product
+    second_flattened = second_out_channels * second_out_height * second_out_width
 
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
 
-    second_flattened = second_out_channels * second_out_height * second_out_width
-
-    tail_linear_updated = False
-    for idx, layer in enumerate(tail_layers):
-        if isinstance(layer, nn.Linear):
-            if debug:
-                print(
-                    "[replace_1st_2nd_fc_with_qtcl] Adjusting remaining linear layer "
-                    f"from in_features={layer.in_features} to {second_flattened}"
-                )
-            tail_layers[idx] = nn.Linear(
-                second_flattened,
-                layer.out_features,
-                bias=layer.bias is not None,
-            ).to(device=device, dtype=dtype)
-            tail_linear_updated = True
-            break
-    if not tail_linear_updated:
-        raise ValueError("Could not locate the final linear layer in the classifier to adjust.")
-
-    bn1_in = nn.BatchNorm2d(in_channels).to(device=device, dtype=dtype) if use_batchnorm else None
-    bn1_out = nn.BatchNorm2d(first_out_channels).to(device=device, dtype=dtype) if use_batchnorm else None
-    bn2_out = nn.BatchNorm2d(second_out_channels).to(device=device, dtype=dtype) if use_batchnorm else None
+    if debug:
+        print(
+            "[replace_1st_2nd_fc_with_qtcl] ResNet head "
+            f"in_features={original_fc.in_features}, out_features={original_fc.out_features}, "
+            f"unflatten=({in_channels}, {in_height}, {in_width}), "
+            f"first_target=({first_out_channels}, {first_out_height}, {first_out_width}), "
+            f"second_target=({second_out_channels}, {second_out_height}, {second_out_width})"
+        )
 
     first_kwargs: Dict[str, Any] = dict(first_qmtl_kwargs or {})
     second_kwargs: Dict[str, Any] = dict(second_qmtl_kwargs or {})
@@ -602,55 +370,55 @@ def replace_1st_2nd_fc_with_qtcl(
         first_kwargs.pop(forbidden, None)
         second_kwargs.pop(forbidden, None)
 
-    qtcl1 = QTCL(
-        in_channels=in_channels,
-        out_channels=first_out_channels,
-        out_height=first_out_height,
-        out_width=first_out_width,
-        **first_kwargs,
-    ).to(device=device, dtype=dtype)
+    bn1_in = nn.BatchNorm2d(in_channels).to(device=device, dtype=dtype) if use_batchnorm else None
+    bn1_out = nn.BatchNorm2d(first_out_channels).to(device=device, dtype=dtype) if use_batchnorm else None
+    bn2_out = nn.BatchNorm2d(second_out_channels).to(device=device, dtype=dtype) if use_batchnorm else None
 
-    qtcl2 = QTCL(
-        in_channels=first_out_channels,
-        out_channels=second_out_channels,
-        out_height=second_out_height,
-        out_width=second_out_width,
-        **second_kwargs,
-    ).to(device=device, dtype=dtype)
-
-    new_classifier_layers: List[nn.Module] = [*prefix_layers, nn.Unflatten(1, (in_channels, in_height, in_width))]
+    head_layers: List[nn.Module] = [nn.Unflatten(1, (in_channels, in_height, in_width))]
     if bn1_in is not None:
-        new_classifier_layers.append(bn1_in)
-    new_classifier_layers.append(qtcl1)
-    if bn1_out is not None:
-        new_classifier_layers.append(bn1_out)
-    new_classifier_layers.extend(between_layers)
-    new_classifier_layers.append(qtcl2)
-    if bn2_out is not None:
-        new_classifier_layers.append(bn2_out)
-    new_classifier_layers.append(nn.Flatten())
-    new_classifier_layers.extend(tail_layers)
-
-    model.classifier = nn.Sequential(*new_classifier_layers)
-
-    if debug:
-        print("[replace_1st_2nd_fc_with_qtcl] Classifier layout after modification:")
-        for idx, layer in enumerate(model.classifier):
-            print(f"  [{idx}]: {layer.__class__.__name__} -> {layer}")
-
-    tracked_layers = tuple(
-        layer for layer in model.classifier if isinstance(layer, (nn.Linear, TCL, QTCL))
+        head_layers.append(bn1_in)
+    head_layers.append(
+        QTCL(
+            in_channels=in_channels,
+            out_channels=first_out_channels,
+            out_height=first_out_height,
+            out_width=first_out_width,
+            **first_kwargs,
+        ).to(device=device, dtype=dtype)
     )
+    if bn1_out is not None:
+        head_layers.append(bn1_out)
+    head_layers.append(
+        QTCL(
+            in_channels=first_out_channels,
+            out_channels=second_out_channels,
+            out_height=second_out_height,
+            out_width=second_out_width,
+            **second_kwargs,
+        ).to(device=device, dtype=dtype)
+    )
+    if bn2_out is not None:
+        head_layers.append(bn2_out)
+    head_layers.extend(
+        [
+            nn.Flatten(),
+            nn.Linear(
+                second_flattened,
+                original_fc.out_features,
+                bias=original_fc.bias is not None,
+            ).to(device=device, dtype=dtype),
+        ]
+    )
+    model.fc = nn.Sequential(*head_layers)
+
+    tracked_layers = _head_tracked_layers(model)
     modified_fc_params = sum(
         p.numel()
         for layer in tracked_layers
         for p in layer.parameters()
         if p.requires_grad
     )
-    if modified_fc_params <= 0 or original_fc_params <= 0:
-        space_saving = float("nan")
-    else:
-        space_saving = 1.0 - (modified_fc_params / original_fc_params)
+    space_saving = float("nan") if original_fc_params <= 0 else 1.0 - (modified_fc_params / original_fc_params)
 
     print(
         "[replace_1st_2nd_fc_with_qtcl] Parameter comparison "
@@ -662,12 +430,17 @@ def replace_1st_2nd_fc_with_qtcl(
 
 
 def build_model(num_classes: int, pretrained: bool, device: torch.device) -> nn.Module:
-    weights = models.AlexNet_Weights.IMAGENET1K_V1 if pretrained else None
-    model = models.alexnet(weights=weights)
-    model.features[0] = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1)
-    model.avgpool = nn.AdaptiveAvgPool2d((3, 3))
-    model.classifier[1] = nn.Linear(256 * 3 * 3, 4096, bias=True)
-    model.classifier[6] = nn.Linear(model.classifier[6].in_features, num_classes, bias=True)
+    weights = None
+    if pretrained:
+        if hasattr(models.ResNet50_Weights, "IMAGENET1K_V2"):
+            weights = models.ResNet50_Weights.IMAGENET1K_V2
+        else:
+            weights = models.ResNet50_Weights.IMAGENET1K_V1
+
+    model = models.resnet50(weights=weights)
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    model.maxpool = nn.Identity()
+    model.fc = nn.Linear(model.fc.in_features, num_classes, bias=True)
     model.to(device)
     return model
 
@@ -718,19 +491,14 @@ def _quantum_block_param_stats(module: QTCL) -> Dict[str, Tuple[int, float]]:
         mean_val = total_sum / total_params if total_params > 0 else float("nan")
         return total_params, mean_val
 
-    stats = {
+    return {
         "B": _stats(module.B.parameters()),
         "PQC": _stats(module.q_layer.parameters()),
         "A": _stats(module.A.parameters()),
     }
-    return stats
 
 
-def log_qtcl_parameter_debug(
-    model: nn.Module,
-    epoch: int,
-    main_process: bool,
-) -> None:
+def log_qtcl_parameter_debug(model: nn.Module, epoch: int, main_process: bool) -> None:
     if not main_process:
         return
     param_model = model.module if isinstance(model, DDP) else model
@@ -780,12 +548,7 @@ def build_dataloaders(
     distributed: bool,
     rank: int,
     world_size: int,
-) -> Tuple[
-    DataLoader,
-    DataLoader,
-    Optional[DistributedSampler],
-    Optional[DistributedSampler],
-]:
+) -> Tuple[DataLoader, DataLoader, Optional[DistributedSampler], Optional[DistributedSampler]]:
     normalize = transforms.Normalize(mean=(0.5071, 0.4867, 0.4408), std=(0.2675, 0.2565, 0.2761))
     train_transform = transforms.Compose(
         [
@@ -795,12 +558,7 @@ def build_dataloaders(
             normalize,
         ]
     )
-    eval_transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            normalize,
-        ]
-    )
+    eval_transform = transforms.Compose([transforms.ToTensor(), normalize])
 
     train_dataset = datasets.CIFAR100(root=data_dir, train=True, download=True, transform=train_transform)
     test_dataset = datasets.CIFAR100(root=data_dir, train=False, download=True, transform=eval_transform)
@@ -885,22 +643,15 @@ def train_one_epoch(
         total += targets.size(0)
 
         if show_progress and total > 0:
-            iterator.set_postfix(
-                loss=running_loss / total,
-                acc=running_correct / total,
-            )
+            iterator.set_postfix(loss=running_loss / total, acc=running_correct / total)
 
     stats = torch.tensor([running_loss, running_correct, total], device=device, dtype=torch.float64)
     if distributed and dist.is_initialized():
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
     running_loss = stats[0].item()
     running_correct = stats[1].item()
-    total = int(stats[2].item())
-    total = max(total, 1)
-
-    epoch_loss = running_loss / total
-    epoch_acc = running_correct / total
-    return epoch_loss, epoch_acc, backbone_stepped
+    total = max(int(stats[2].item()), 1)
+    return running_loss / total, running_correct / total, backbone_stepped
 
 
 @torch.no_grad()
@@ -931,22 +682,15 @@ def evaluate(
         total += targets.size(0)
 
         if show_progress and total > 0:
-            iterator.set_postfix(
-                loss=running_loss / total,
-                acc=running_correct / total,
-            )
+            iterator.set_postfix(loss=running_loss / total, acc=running_correct / total)
 
     stats = torch.tensor([running_loss, running_correct, total], device=device, dtype=torch.float64)
     if distributed and dist.is_initialized():
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
     running_loss = stats[0].item()
     running_correct = stats[1].item()
-    total = int(stats[2].item())
-    total = max(total, 1)
-
-    epoch_loss = running_loss / total
-    epoch_acc = running_correct / total
-    return epoch_loss, epoch_acc
+    total = max(int(stats[2].item()), 1)
+    return running_loss / total, running_correct / total
 
 
 def init_distributed(args: argparse.Namespace) -> torch.device:
@@ -966,10 +710,8 @@ def init_distributed(args: argparse.Namespace) -> torch.device:
             raise RuntimeError("Distributed training requires CUDA availability.")
         torch.cuda.set_device(args.local_rank)
         dist.init_process_group(backend=args.dist_backend, init_method="env://")
-        device = torch.device("cuda", args.local_rank)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return device
+        return torch.device("cuda", args.local_rank)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def cleanup_distributed(args: argparse.Namespace) -> None:
@@ -982,7 +724,7 @@ def is_main_process(args: argparse.Namespace) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train AlexNet on CIFAR-100 using PyTorch.")
+    parser = argparse.ArgumentParser(description="Train ResNet50 on CIFAR-100 using PyTorch.")
     parser.add_argument("--data-dir", type=Path, default=Path("./data"), help="Dataset root directory.")
     parser.add_argument("--batch-size", type=int, default=128, help="Mini-batch size.")
     parser.add_argument("--epochs", type=int, default=160, help="Number of training epochs.")
@@ -994,15 +736,15 @@ def main() -> None:
     parser.add_argument(
         "--model",
         type=str,
-        default="alexnet",
+        default="resnet50",
         choices=[
-            "alexnet",
-            "alexnet_tcl",
-            "alexnet_tcl1",
-            "alexnet_tcl12",
-            "alexnet_qtcl",
-            "alexnet_qtcl1",
-            "alexnet_qtcl12",
+            "resnet50",
+            "resnet50_tcl",
+            "resnet50_tcl1",
+            "resnet50_tcl12",
+            "resnet50_qtcl",
+            "resnet50_qtcl1",
+            "resnet50_qtcl12",
         ],
         help="Model variant to train.",
     )
@@ -1012,10 +754,7 @@ def main() -> None:
         dest="tcl1_out_channels",
         type=int,
         default=64,
-        help=(
-            "Output channel count for first replacement when using "
-            "--model alexnet_tcl1/alexnet_tcl12/alexnet_qtcl1/alexnet_qtcl12."
-        ),
+        help="Output channel count for the first TCL/QTCL head contraction stage.",
     )
     parser.add_argument(
         "--tcl-out-height",
@@ -1023,10 +762,7 @@ def main() -> None:
         dest="tcl1_out_height",
         type=int,
         default=8,
-        help=(
-            "Output height for first replacement when using "
-            "--model alexnet_tcl1/alexnet_tcl12/alexnet_qtcl1/alexnet_qtcl12."
-        ),
+        help="Output height for the first TCL/QTCL head contraction stage.",
     )
     parser.add_argument(
         "--tcl-out-width",
@@ -1034,40 +770,28 @@ def main() -> None:
         dest="tcl1_out_width",
         type=int,
         default=8,
-        help=(
-            "Output width for first replacement when using "
-            "--model alexnet_tcl1/alexnet_tcl12/alexnet_qtcl1/alexnet_qtcl12."
-        ),
+        help="Output width for the first TCL/QTCL head contraction stage.",
     )
     parser.add_argument(
         "--tcl2-out-channels",
         type=int,
         default=32,
-        help="Output channel count for second replacement when using --model alexnet_tcl12/alexnet_qtcl12.",
+        help="Output channel count for the optional second TCL/QTCL head contraction stage.",
     )
     parser.add_argument(
         "--tcl2-out-height",
         type=int,
         default=8,
-        help="Output height for second replacement when using --model alexnet_tcl12/alexnet_qtcl12.",
+        help="Output height for the optional second TCL/QTCL head contraction stage.",
     )
     parser.add_argument(
         "--tcl2-out-width",
         type=int,
         default=8,
-        help="Output width for second replacement when using --model alexnet_tcl12/alexnet_qtcl12.",
+        help="Output width for the optional second TCL/QTCL head contraction stage.",
     )
-    parser.add_argument(
-        "--tcl-debug",
-        action="store_true",
-        help="Enable verbose debugging for TCL/QTCL replacements.",
-    )
-    parser.add_argument(
-        "--qtcl-n-qubits",
-        type=int,
-        default=8,
-        help="Number of qubits for quantum TCL replacements.",
-    )
+    parser.add_argument("--tcl-debug", action="store_true", help="Enable verbose debugging for TCL/QTCL replacements.")
+    parser.add_argument("--qtcl-n-qubits", type=int, default=8, help="Number of qubits for quantum TCL replacements.")
     parser.add_argument(
         "--qtcl-n-layers",
         type=int,
@@ -1084,7 +808,7 @@ def main() -> None:
         "--qtcl-alpha",
         type=float,
         default=0.5,
-        help="Mixing coefficient between classical and quantum paths for the first QTCL block (0→classical, 1→quantum).",
+        help="Mixing coefficient between classical and quantum paths for the first QTCL block.",
     )
     parser.add_argument(
         "--qtcl-learnable-alpha",
@@ -1103,14 +827,9 @@ def main() -> None:
         "--qtcl-shots",
         type=int,
         default=0,
-        help="Quantum shots for TCL replacements (0 means analytic expectation).",
+        help="Quantum shots for QTCL replacements (0 means analytic expectation).",
     )
-    parser.add_argument(
-        "--qtcl-ansatz",
-        type=str,
-        default="HEA",
-        help="Variational ansatz key for quantum TCL replacements.",
-    )
+    parser.add_argument("--qtcl-ansatz", type=str, default="HEA", help="Variational ansatz key for QTCL.")
     parser.add_argument(
         "--qtcl-ansatz-kwargs",
         type=str,
@@ -1121,25 +840,25 @@ def main() -> None:
         "--qtcl2-n-qubits",
         type=int,
         default=None,
-        help="Override qubit count for the second quantum TCL stage when using --model alexnet_qtcl12.",
+        help="Override qubit count for the optional second QTCL stage when using --model resnet50_qtcl12.",
     )
     parser.add_argument(
         "--qtcl2-n-layers",
         type=int,
         default=None,
-        help="Override layer count for the second quantum TCL stage when using --model alexnet_qtcl12.",
+        help="Override layer count for the optional second QTCL stage when using --model resnet50_qtcl12.",
     )
     parser.add_argument(
         "--qtcl2-F",
         type=int,
         default=None,
-        help="Override latent feature width F for the second quantum TCL stage when using --model alexnet_qtcl12.",
+        help="Override latent feature width F for the optional second QTCL stage.",
     )
     parser.add_argument(
         "--qtcl2-alpha",
         type=float,
         default=None,
-        help="Override the mixing coefficient alpha for the second QTCL block when using --model alexnet_qtcl12.",
+        help="Override the mixing coefficient alpha for the second QTCL block.",
     )
     parser.add_argument(
         "--qtcl2-learnable-alpha",
@@ -1158,19 +877,19 @@ def main() -> None:
         "--qtcl2-shots",
         type=int,
         default=None,
-        help="Override shots for the second quantum TCL stage when using --model alexnet_qtcl12 (0 means analytic).",
+        help="Override shots for the optional second QTCL stage (0 means analytic).",
     )
     parser.add_argument(
         "--qtcl2-ansatz",
         type=str,
         default=None,
-        help="Override ansatz key for the second quantum TCL stage when using --model alexnet_qtcl12.",
+        help="Override ansatz key for the optional second QTCL stage.",
     )
     parser.add_argument(
         "--qtcl2-ansatz-kwargs",
         type=str,
         default=None,
-        help="Override ansatz kwargs (JSON dict) for the second quantum TCL stage when using --model alexnet_qtcl12.",
+        help="Override ansatz kwargs (JSON dict) for the optional second QTCL stage.",
     )
     parser.add_argument(
         "--qtcl-lr",
@@ -1195,11 +914,14 @@ def main() -> None:
     parser.add_argument(
         "--qtcl-batchnorm",
         action="store_true",
-        help="Retain BatchNorm2d layers before and after each QMTL block (default: disabled).",
+        help="Retain BatchNorm2d layers before and after each QTCL block in the two-stage path.",
     )
     parser.add_argument("--train-fraction", type=float, default=1.0, help="Fraction of training data to use.")
     parser.add_argument(
-        "--val-fraction", type=float, default=1.0, help="Fraction of validation data to use as a proxy for testing."
+        "--val-fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of validation data to use as a proxy for testing.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for dataset subsampling.")
     parser.add_argument(
@@ -1209,7 +931,7 @@ def main() -> None:
         help="Directory where checkpoints and training plots are stored.",
     )
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
-    parser.add_argument("--lr-step-size", type=int, default=30, help="Step size (in epochs) for learning rate decay.")
+    parser.add_argument("--lr-step-size", type=int, default=50, help="Step size (in epochs) for learning rate decay.")
     parser.add_argument("--lr-gamma", type=float, default=0.1, help="Multiplicative factor of learning rate decay.")
     parser.add_argument(
         "--dist-backend",
@@ -1221,7 +943,7 @@ def main() -> None:
         "--freeze-backbone-epochs",
         type=int,
         default=0,
-        help="Number of initial epochs to skip SGD updates on the backbone while QMTL adapts.",
+        help="Number of initial epochs to skip SGD updates on the backbone while QTCL adapts.",
     )
     args = parser.parse_args()
     args.qtcl_betas = tuple(args.qtcl_betas)
@@ -1232,7 +954,6 @@ def main() -> None:
     main_process = is_main_process(args)
 
     args.output_dir = Path(args.output_dir)
-
     if main_process:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         run_log_path = enable_run_log(args.output_dir)
@@ -1249,33 +970,25 @@ def main() -> None:
     model = build_model(num_classes=100, pretrained=args.pretrained, device=device)
 
     model_variant = args.model
-    if model_variant == "alexnet_tcl":
-        model_variant = "alexnet_tcl1"
-    if model_variant == "alexnet_qtcl":
-        model_variant = "alexnet_qtcl1"
+    if model_variant == "resnet50_tcl":
+        model_variant = "resnet50_tcl1"
+    if model_variant == "resnet50_qtcl":
+        model_variant = "resnet50_qtcl1"
 
-    first_stage_variants = {"alexnet_tcl1", "alexnet_tcl12", "alexnet_qtcl1", "alexnet_qtcl12"}
-    second_stage_variants = {"alexnet_tcl12", "alexnet_qtcl12"}
+    first_stage_variants = {"resnet50_tcl1", "resnet50_tcl12", "resnet50_qtcl1", "resnet50_qtcl12"}
+    second_stage_variants = {"resnet50_tcl12", "resnet50_qtcl12"}
 
     if model_variant in first_stage_variants:
-        if (
-            args.tcl1_out_channels <= 0
-            or args.tcl1_out_height <= 0
-            or args.tcl1_out_width <= 0
-        ):
+        if args.tcl1_out_channels <= 0 or args.tcl1_out_height <= 0 or args.tcl1_out_width <= 0:
             raise ValueError("First replacement output dimensions must be positive integers.")
 
     if model_variant in second_stage_variants:
-        if (
-            args.tcl2_out_channels <= 0
-            or args.tcl2_out_height <= 0
-            or args.tcl2_out_width <= 0
-        ):
+        if args.tcl2_out_channels <= 0 or args.tcl2_out_height <= 0 or args.tcl2_out_width <= 0:
             raise ValueError("Second replacement output dimensions must be positive integers.")
 
     qtcl_first_kwargs: Optional[Dict[str, Any]] = None
     qtcl_second_kwargs: Optional[Dict[str, Any]] = None
-    if model_variant in {"alexnet_qtcl1", "alexnet_qtcl12"}:
+    if model_variant in {"resnet50_qtcl1", "resnet50_qtcl12"}:
         if args.qtcl_n_qubits <= 0:
             raise ValueError("qtcl-n-qubits must be a positive integer.")
         if args.qtcl_n_layers <= 0:
@@ -1304,7 +1017,6 @@ def main() -> None:
             "alpha": args.qtcl_alpha,
             "learnable_alpha": args.qtcl_learnable_alpha,
         }
-
         qtcl_second_kwargs = copy.deepcopy(qtcl_first_kwargs)
 
         if args.qtcl2_n_qubits is not None:
@@ -1340,7 +1052,7 @@ def main() -> None:
         if args.qtcl2_learnable_alpha is not None:
             qtcl_second_kwargs["learnable_alpha"] = args.qtcl2_learnable_alpha
 
-    if model_variant == "alexnet_tcl1":
+    if model_variant == "resnet50_tcl1":
         model = replace_1st_fc_with_tcl(
             model,
             out_channels=args.tcl1_out_channels,
@@ -1348,7 +1060,7 @@ def main() -> None:
             out_width=args.tcl1_out_width,
             debug=args.tcl_debug and main_process,
         )
-    elif model_variant == "alexnet_tcl12":
+    elif model_variant == "resnet50_tcl12":
         model = replace_1st_2nd_fc_with_tcl(
             model,
             first_out_channels=args.tcl1_out_channels,
@@ -1359,7 +1071,7 @@ def main() -> None:
             second_out_width=args.tcl2_out_width,
             debug=args.tcl_debug and main_process,
         )
-    elif model_variant == "alexnet_qtcl1":
+    elif model_variant == "resnet50_qtcl1":
         model = replace_1st_fc_with_qtcl(
             model,
             out_channels=args.tcl1_out_channels,
@@ -1369,7 +1081,7 @@ def main() -> None:
             qmtl_kwargs=qtcl_first_kwargs,
             debug=args.tcl_debug and main_process,
         )
-    elif model_variant == "alexnet_qtcl12":
+    elif model_variant == "resnet50_qtcl12":
         model = replace_1st_2nd_fc_with_qtcl(
             model,
             first_out_channels=args.tcl1_out_channels,
@@ -1383,6 +1095,7 @@ def main() -> None:
             second_qmtl_kwargs=qtcl_second_kwargs,
             debug=args.tcl_debug and main_process,
         )
+
     if args.distributed:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     dummy_forward_pass(model, device, log=main_process)
@@ -1425,6 +1138,7 @@ def main() -> None:
             betas=args.qtcl_betas,
             weight_decay=args.qtcl_weight_decay,
         )
+
     if args.lr_step_size <= 0:
         raise ValueError("lr_step_size must be a positive integer.")
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
@@ -1493,9 +1207,7 @@ def main() -> None:
 
             if main_process and best_val_acc > previous_best:
                 best_checkpoint_path = args.output_dir / "checkpoint_best_acc.pth"
-                checkpoint_args = {
-                    k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()
-                }
+                checkpoint_args = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
                 checkpoint = {
                     "epoch": epoch,
                     "model_state_dict": param_model.state_dict(),
@@ -1603,9 +1315,7 @@ def main() -> None:
 
     if main_process:
         if best_val_acc_epoch > 0:
-            print(
-                f"Best validation accuracy: {best_val_acc * 100:.2f}% (epoch {best_val_acc_epoch:02d})"
-            )
+            print(f"Best validation accuracy: {best_val_acc * 100:.2f}% (epoch {best_val_acc_epoch:02d})")
         else:
             print("Best validation accuracy: N/A")
 

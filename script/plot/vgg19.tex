@@ -1,0 +1,35 @@
+\begin{table}[t]
+\centering
+\small
+\caption{VGG--19 --- moderate compression (FC1 replaced only).}
+\label{tab:vgg_moderate}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model} & \textbf{Val Acc (\%)} & \textbf{$\Delta$Acc} & \textbf{Saving (\%)} \\
+\midrule
+VGG--19               & 72.21 & ---              & ---   \\
+TCL1                  & 71.83 & $-$0.38          & 45.80 \\
+QTCL1                 & 71.47 & $-$0.74          & 46.50 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\caption{VGG--19 --- aggressive compression (FC1+FC2 replaced). \textbf{Headline result}: QTCL12 outperforms TCL12 by 4.19 pp at greater savings and closes nearly all of the gap to the baseline.}
+\label{tab:vgg_aggressive}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model} & \textbf{Val Acc (\%)} & \textbf{$\Delta$Acc} & \textbf{Saving (\%)} \\
+\midrule
+VGG--19                         & 72.21 & ---              & ---   \\
+TCL12                           & 67.48 & $-$4.73          & 97.27 \\
+\textbf{QTCL12}      & \textbf{71.67} & $\mathbf{-0.54}$ & \textbf{98.68} \\
+\bottomrule
+\end{tabular}
+\end{table}

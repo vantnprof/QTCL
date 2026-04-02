@@ -1,0 +1,63 @@
+{
+  "args": {
+    "allow_partial_init": true,
+    "batch_size": 128,
+    "effective_qtcl2_F": null,
+    "effective_qtcl2_ansatz": "HEA",
+    "effective_qtcl2_ansatz_kwargs": "{}",
+    "effective_qtcl2_shots": 0,
+    "epochs": 160,
+    "freeze_backbone_epochs": 0,
+    "init_checkpoint": "/work/vantn/QTCL/results/vgg19_qtcl12_alpha0.5/checkpoint_best_acc.pth",
+    "lr": 0.01,
+    "lr_gamma": 0.1,
+    "lr_step_size": 40,
+    "momentum": 0.9,
+    "no_progress": false,
+    "num_workers": 8,
+    "pretrained": false,
+    "qtcl2_F": null,
+    "qtcl2_ansatz": null,
+    "qtcl2_ansatz_kwargs": null,
+    "qtcl2_shots": null,
+    "qtcl_F": null,
+    "qtcl_alpha": 0.5,
+    "qtcl_ansatz": "HEA",
+    "qtcl_ansatz_kwargs": "{}",
+    "qtcl_batchnorm": true,
+    "qtcl_betas": [
+      0.9,
+      0.999
+    ],
+    "qtcl_lr": 0.005,
+    "qtcl_shots": 0,
+    "qtcl_weight_decay": 0.0001,
+    "rerun": false,
+    "tcl1_out_channels": 512,
+    "tcl1_out_height": 3,
+    "tcl1_out_width": 3,
+    "tcl2_out_channels": 512,
+    "tcl2_out_height": 3,
+    "tcl2_out_width": 3,
+    "train_last_classifier_fc_layers": 3,
+    "weight_decay": 0.0001
+  },
+  "data_dir": "/work/vantn/QTCL/data",
+  "depths": [
+    3
+  ],
+  "expected_reference_point": {
+    "depth": 2,
+    "n_qubits": 8,
+    "space_saving": 0.9868
+  },
+  "model": "vgg19_qtcl12",
+  "output_dir": "/work/vantn/QTCL/results/ablation_study_qubit_depth",
+  "qubits": [
+    10
+  ],
+  "seed": 42,
+  "train_fraction": 1.0,
+  "training_module": "script.exp.vgg19_cifar100",
+  "val_fraction": 1.0
+}

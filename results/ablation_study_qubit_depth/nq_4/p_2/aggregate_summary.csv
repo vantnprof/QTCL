@@ -1,0 +1,2 @@
+num_seeds,seeds,best_val_acc_mean,best_val_acc_std,best_val_acc_epoch_mean,best_val_acc_epoch_std,best_val_loss_mean,best_val_loss_std,best_val_loss_epoch_mean,best_val_loss_epoch_std,final_train_loss_mean,final_train_loss_std,final_train_acc_mean,final_train_acc_std,final_val_loss_mean,final_val_loss_std,final_val_acc_mean,final_val_acc_std
+1,42,0.6592,0.0,136.0,0.0,2.674280669784546,0.0,145.0,0.0,0.16578429552555085,0.0,0.95362,0.0,2.795624402999878,0.0,0.656,0.0

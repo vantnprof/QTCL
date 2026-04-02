@@ -1,0 +1,35 @@
+\begin{table}[t]
+\centering
+\small
+\caption{AlexNet --- moderate compression (FC1 replaced only).}
+\label{tab:alex_moderate}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model} & \textbf{Val Acc (\%)} & \textbf{$\Delta$Acc} & \textbf{Saving (\%)} \\
+\midrule
+AlexNet              & 65.70 & ---              & ---   \\
+TCL1                  & 66.56 & $+$0.86          & 62.77 \\
+QTCL1      & 63.53 & $-$2.17          & 63.00 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\caption{AlexNet --- aggressive compression (FC1+FC2 replaced).}
+\label{tab:alex_aggressive}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model} & \textbf{Val Acc (\%)} & \textbf{$\Delta$Acc} & \textbf{Saving (\%)} \\
+\midrule
+AlexNet              & 65.70 & ---              & ---    \\
+TCL12                & 65.69 & $-$0.01          & 98.64  \\
+QTCL12      & 57.92 & $-$7.78          & 99.10  \\
+\bottomrule
+\end{tabular}
+\end{table}
