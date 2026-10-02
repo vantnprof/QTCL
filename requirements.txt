@@ -1,0 +1,7 @@
+# Python 3.11. Install a matching CPU/CUDA torch + torchvision pair first if needed.
+# Bounded dependency ranges; this file is not an exact environment lock.
+torch>=2.5,<3
+torchvision>=0.20,<1
+pennylane>=0.40,<0.46
+matplotlib>=3.8,<4
+tqdm>=4.66,<5

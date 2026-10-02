@@ -1,207 +1,248 @@
 # QTCL: Quantum-based Tensor Contraction Layers
 
-PyTorch implementation of tensor-contraction classifiers and hybrid quantum-classical tensor-contraction classifiers for CIFAR-100.
+**Hybrid quantum–classical prediction heads for compressed image classifiers**
 
-This repository is maintained to reproduce the experimental results reported in the SPIE MLCD paper **"Quantum-based tensor contraction layers"**.
+Research implementation by **Van Tien Nguyen** and **Panagiotis (Panos) Markopoulos** for the SPIE *Machine Learning from Challenging Data (MLCD)* paper **“Quantum-based Tensor Contraction Layers.”**
 
-This repository includes:
-- classical Tensor Contraction Layers (TCL),
-- Quantum TCL (QTCL) with configurable quantum ansatz and mixing coefficient,
-- experiment pipelines for AlexNet and VGG19 with reproducible CSV/plot outputs.
+[Manuscript](https://www.spiedigitallibrary.org/conference-proceedings-of-spie/14030/140300I/Quantum-based-tensor-contraction-layers/10.1117/12.3098024.short) · [Presentation slides](presentation/QTCL_MLCD2026_SPIE.pdf)
 
-## Paper Scope
+QTCL extends the classical Tensor Contraction Layer (TCL) by preserving its spatial contractions and compressing its channel map through two thin classical projections and a parameterized quantum circuit. The head blends classical features with quantum expectation values and trains jointly with a PyTorch image classifier.
 
-- Paper title: *Quantum-based tensor contraction layers*
-- Venue: SPIE Defense + Commercial Sensing, *Machine Learning from Challenging Data (MLCD)*
-- Conference page: https://spie.org/ds/conferencedetails/machine-learning-from-challenging-data
-- Repository role: code and experiment scripts for reproducing the paper's AlexNet/VGG19 CIFAR-100 TCL/QTCL results
+- Quantum circuits use **PennyLane**, its `default.qubit` simulator, and `qml.qnn.TorchLayer` with the PyTorch interface. See the [PennyLane PyTorch documentation](https://docs.pennylane.ai/en/stable/introduction/interfaces/torch.html).
+- Supported circuit families are `HEA`, `SLE`, `QAOA`, `MPS`, and `MERA`.
+- Principal experiments compare fully connected, TCL, and QTCL heads on AlexNet and VGG19 with CIFAR-100. Additional drivers cover ResNet50, limited training data, and qubit/depth ablations.
+- The supplied implementation runs quantum simulation locally. Head-parameter savings measure model compression; they do not establish a quantum runtime advantage.
 
-## Overview
+## Installation
 
-The experiment entry points are:
-- `script/exp/alexnet_cifar100.py`
-- `script/exp/vgg19_cifar100.py`
+Use **Python 3.11** and run all commands from the repository root in a Bash-compatible shell.
 
-Each script:
-- loads CIFAR-100 with standard augmentation,
-- swaps one or two fully connected classifier layers with TCL/QTCL blocks,
-- trains with SGD (and AdamW for quantum parameters when QTCL is enabled),
-- writes metrics, curves, and best checkpoints to `results/<experiment_name>/`.
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
 
-## Repository Structure
+[`requirements.txt`](requirements.txt) includes PyTorch, torchvision, PennyLane, Matplotlib, and tqdm. It specifies version ranges rather than an exact environment lock.
+
+The quick start, circuit sanity check, and plotting commands were validated with Python 3.11, PyTorch `2.5.1+cpu`, torchvision `0.20.1+cpu`, and PennyLane `0.45.1`.
+
+For a specific CPU/CUDA build, install a compatible PyTorch/torchvision pair using the [official PyTorch instructions](https://pytorch.org/get-started/previous-versions/) before installing the requirements. Training selects CUDA when available and otherwise uses CPU.
+
+Check the imports:
+
+```bash
+python -c "import torch, torchvision, pennylane, matplotlib, tqdm; print('Imports OK; PennyLane', pennylane.__version__)"
+```
+
+## Quick start
+
+Run a short QTCL experiment with a small subset of CIFAR-100:
+
+```bash
+python -m script.exp.alexnet_cifar100 \
+  --model alexnet_qtcl --epochs 1 --batch-size 16 \
+  --train-fraction 0.01 --val-fraction 0.01 --num-workers 0 \
+  --qtcl-n-qubits 4 --qtcl-n-layers 1 --qtcl-alpha 0.6 \
+  --output-dir runs/quickstart
+```
+
+The first run downloads CIFAR-100 into `data/`. This small run checks the workflow; its accuracy is not intended to reproduce the manuscript. Quantum simulation can take longer than classical training.
+
+| File | Contents |
+| --- | --- |
+| `training_log.csv` | Per-epoch training and validation loss/accuracy |
+| `training_summary.csv` | Best and final metrics |
+| `training_curves.png` | Loss and accuracy curves |
+| `checkpoint_best_acc.pth` | Best validation-accuracy checkpoint, including model and training arguments |
+| `run.log` | Console output |
+
+Choose a new `--output-dir` to preserve a previous run; reusing a directory can overwrite its files. Use `python -m` for project entry points so imports resolve from the repository root.
+
+## Experiments
+
+### CIFAR-100 and model variants
+
+CIFAR-100 downloads automatically under `--data-dir` (default `./data`). Training uses random cropping, horizontal flips, and normalization; evaluation uses normalization. `--train-fraction` and `--val-fraction` control the subsets.
+
+**Evaluation convention:** the scripts label evaluation metrics as validation metrics, but evaluate on the official CIFAR-100 test split and use that split to select the best checkpoint.
+
+| Variant | AlexNet | VGG19 |
+| --- | --- | --- |
+| Original classifier | `alexnet` | `vgg19` |
+| First FC layer replaced by TCL | `alexnet_tcl` | `vgg19_tcl` |
+| First two FC layers replaced by TCL | `alexnet_tcl12` | `vgg19_tcl12` |
+| First FC layer replaced by QTCL | `alexnet_qtcl` | `vgg19_qtcl` |
+| First two FC layers replaced by QTCL | `alexnet_qtcl12` | `vgg19_qtcl12` |
+
+Single-layer replacements also accept `_tcl1` and `_qtcl1` suffixes. `--pretrained` initializes the backbone from ImageNet weights; by default models start from random initialization.
+
+### AlexNet
+
+```bash
+python -m script.exp.alexnet_cifar100 \
+  --model alexnet --output-dir runs/alexnet
+
+python -m script.exp.alexnet_cifar100 \
+  --model alexnet_tcl12 --output-dir runs/alexnet-tcl12
+
+python -m script.exp.alexnet_cifar100 \
+  --model alexnet_qtcl --qtcl-alpha 0.6 --output-dir runs/alexnet-qtcl1
+
+python -m script.exp.alexnet_cifar100 \
+  --model alexnet_qtcl12 --qtcl-alpha 0.6 --output-dir runs/alexnet-qtcl12
+```
+
+### VGG19
+
+```bash
+python -m script.exp.vgg19_cifar100 \
+  --model vgg19 --num-seeds 1 --output-dir runs/vgg19
+
+python -m script.exp.vgg19_cifar100 \
+  --model vgg19_tcl12 --num-seeds 1 --output-dir runs/vgg19-tcl12
+
+python -m script.exp.vgg19_cifar100 \
+  --model vgg19_qtcl --qtcl-alpha 0.6 --num-seeds 1 \
+  --output-dir runs/vgg19-qtcl1
+
+python -m script.exp.vgg19_cifar100 \
+  --model vgg19_qtcl12 --qtcl-alpha 0.5 --num-seeds 1 \
+  --output-dir runs/vgg19-qtcl12
+```
+
+VGG19 defaults to **five consecutive seeds**, starting at `--seed 42`. Use `--num-seeds 1` for one run, or `--seeds 0 1 2 3 4` for explicit seeds. Multiple runs write per-seed artifacts under `seed_<seed>/`, plus `seed_summaries.csv`, `aggregate_summary.csv`, and `aggregate_training_log.csv`. The root directory also contains `experiment_config.json` and `run.log`.
+
+These commands use current script defaults. Archived runs may use different settings; consult saved configurations, checkpoint arguments, and logs in [`results/`](results/) before attempting an exact reproduction.
+
+### Training and quantum settings
+
+AlexNet and VGG19 default to 160 epochs, training batches of 128, SGD with learning rate `0.01`, momentum `0.9`, and weight decay `1e-4`. Quantum parameters use a separate AdamW optimizer with learning rate `5e-3`. StepLR decays the learning rate by `0.1` every 30 epochs for AlexNet and every 40 epochs for VGG19.
+
+| Option | Meaning / default |
+| --- | --- |
+| `--qtcl-n-qubits` | Circuit width, `8` |
+| `--qtcl-n-layers` | Circuit depth, `2` |
+| `--qtcl-F` | Measured quantum features, defaults to qubit count; use `1 <= F <= n_qubits` |
+| `--qtcl-alpha` | Quantum mixing weight, `0.5`; `0` selects classical features and `1` selects quantum features |
+| `--qtcl-learnable-alpha` | Train the mixing weight through a sigmoid parameterization |
+| `--qtcl-shots` | `0` for analytic expectations; positive values enable finite-shot sampling |
+| `--qtcl-ansatz` | `HEA` (default), `SLE`, `QAOA`, `MPS`, or `MERA` |
+| `--qtcl-ansatz-kwargs` | JSON object passed to the circuit builder |
+| `--qtcl-lr` | Quantum-parameter learning rate |
+| `--freeze-backbone-epochs` | Initial epochs with backbone SGD updates frozen |
+
+For two QTCL blocks, second-block overrides include `--qtcl2-n-qubits`, `--qtcl2-n-layers`, `--qtcl2-F`, `--qtcl2-alpha`, `--qtcl2-learnable-alpha`, `--qtcl2-shots`, `--qtcl2-ansatz`, and `--qtcl2-ansatz-kwargs`. See each driver's `--help` for inheritance rules and all available options.
+
+### Qubit/depth and limited-data studies
+
+```bash
+python -m script.exp.ablation_study_qubit_depth \
+  --qubits 4 8 --depths 1 2 --epochs 160 --output-dir runs/qubit-depth
+
+python -m script.exp.limited_training_data \
+  --methods vgg19 tcl12 qtcl12 --fractions 0.1 0.25 0.5 1.0 \
+  --epochs 160 --output-dir runs/limited-data
+```
+
+These sweeps launch multiple VGG19 training runs and can take substantially longer than the quick start. ResNet50 has separate training and checkpoint-evaluation drivers under `script/exp/` and `script/eval/`; inspect their `--help` for its model variants.
+
+### Multiple GPUs
+
+Training drivers detect distributed execution through `RANK` and `WORLD_SIZE`. For two CUDA GPUs:
+
+```bash
+torchrun --standalone --nproc_per_node=2 --module script.exp.alexnet_cifar100 \
+  --model alexnet_qtcl12 --qtcl-alpha 0.6 --output-dir runs/alexnet-qtcl12-ddp
+```
+
+## Evaluation and plotting
+
+Evaluate an original-classifier checkpoint produced by the AlexNet baseline run:
+
+```bash
+python -m script.eval.alexnet_cifar100 \
+  --checkpoint runs/alexnet/checkpoint_best_acc.pth --num-workers 0
+```
+
+Equivalent evaluation drivers exist for VGG19 and ResNet50. They reconstruct the model from saved training arguments; `--val-fraction 1.0` requests the full evaluation split.
+
+**Known limitation:** evaluation of the quick-start QTCL checkpoint currently fails with unexpected `U1`/`U2` state-dictionary keys because the evaluator loads weights before initializing the layer's spatial parameters. Training and its recorded validation metrics work; consult `training_log.csv` and `training_summary.csv` for those results.
+
+Training automatically plots each run's curves. To regenerate the manuscript's accuracy/compression trade-off figures:
+
+```bash
+python -m script.plot.plot_alexnet_cifar100 --output-dir runs/figures
+python -m script.plot.plot_vgg19_cifar100 --output-dir runs/figures
+```
+
+These scripts read the fixed tables [`alex.tex`](script/plot/alex.tex) and [`vgg19.tex`](script/plot/vgg19.tex), rather than recomputing values from new training runs. Each writes PNG and PDF figures; use `--tex-path` to supply another table.
+
+## Results reported in the manuscript
+
+These VGG19 values are reported in the manuscript linked above and included in the [plotting tables](script/plot/vgg19.tex). Savings refer to **head parameters**, relative to the uncompressed classifier.
+
+| VGG19 head | Top-1 accuracy (%) | Head-parameter reduction (%) |
+| --- | ---: | ---: |
+| Original FC classifier | 72.21 | — |
+| TCL, first two FC layers replaced | 67.48 | 97.27 |
+| QTCL, first two FC layers replaced | 71.67 | 98.68 |
+
+At aggressive compression, QTCL improves on TCL by 4.19 percentage points. Archived metrics, training curves, and sweep outputs are in [`results/`](results/). These reported values are not recomputed by the quick start and are not multi-seed means with uncertainty estimates.
+
+## Repository layout
 
 ```text
-QTCL/
-├── script/exp/
-│   ├── alexnet_cifar100.py       # AlexNet experiments
-│   └── vgg19_cifar100.py         # VGG19 experiments
-├── src/tcl/tcl.py                # Classical tensor contraction layer
-├── src/qtcl/qtcl.py              # Quantum TCL layer
-├── src/qtcl/ansatz.py            # Registered ansatz builders (HEA/SLE/QAOA/MPS/MERA)
-└── results/                      # Experiment outputs (CSV, checkpoint, curves)
+src/
+  tcl/tcl.py                     Classical tensor contraction layer
+  qtcl/qtcl.py                   PennyLane/PyTorch quantum tensor contraction layer
+  qtcl/ansatz.py                 HEA, SLE, QAOA, MPS, and MERA circuit builders
+script/
+  exp/                          Training and sweep entry points
+  eval/                         Checkpoint evaluation drivers
+  plot/                         Trade-off plotting scripts and LaTeX source tables
+data/                           Local CIFAR-100 downloads and data artifacts
+results/                        Archived experiment metrics and figures
+presentation/                   MLCD presentation slides
+requirements.txt                Training, simulation, and plotting dependencies
 ```
 
-## Model Variants
+## Validation
 
-Both experiment scripts support the same variant pattern:
-
-| Variant suffix | Meaning |
-|---|---|
-| `(base)` | Original classifier (no TCL/QTCL replacement) |
-| `_tcl` or `_tcl1` | Replace first FC layer with TCL |
-| `_tcl12` | Replace first and second FC layers with TCL |
-| `_qtcl` or `_qtcl1` | Replace first FC layer with QTCL |
-| `_qtcl12` | Replace first and second FC layers with QTCL |
-
-Examples:
-- AlexNet: `alexnet`, `alexnet_tcl`, `alexnet_tcl12`, `alexnet_qtcl`, `alexnet_qtcl12`
-- VGG19: `vgg19`, `vgg19_tcl`, `vgg19_tcl12`, `vgg19_qtcl`, `vgg19_qtcl12`
-
-## Environment Setup
-
-1. Create and activate a virtual environment.
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-```
-
-2. Install PyTorch (select the wheel matching your CUDA/CPU setup from PyTorch official docs), then install project dependencies:
-```bash
-pip install torch torchvision
-pip install pennylane matplotlib tqdm
-```
-
-3. Optional sanity check:
-```bash
-python -c "import torch, torchvision, pennylane, matplotlib, tqdm; print('ok')"
-```
-
-## Data and Preprocessing
-
-- Dataset: CIFAR-100 (auto-downloaded under `--data-dir`, default `./data`)
-- Train transform: random crop (32, padding=4) + random horizontal flip + normalization
-- Validation transform: normalization only
-- Subsampling controls:
-  - `--train-fraction` (default `1.0`)
-  - `--val-fraction` (default `1.0`)
-
-## Reproducible Commands
-
-All commands below are from repository root.
-
-### AlexNet Runs
+Check the registered PennyLane circuits and inspect the training options:
 
 ```bash
-# Baseline
-python script/exp/alexnet_cifar100.py --model alexnet --output-dir results/alexnet
-
-# TCL
-python script/exp/alexnet_cifar100.py --model alexnet_tcl --output-dir results/alexnet_tcl
-python script/exp/alexnet_cifar100.py --model alexnet_tcl12 --output-dir results/alexnet_tcl12
-
-# QTCL (single replacement)
-python script/exp/alexnet_cifar100.py --model alexnet_qtcl --qtcl-alpha 0.6 --output-dir results/alexnet_qtcl_alpha0.6
-python script/exp/alexnet_cifar100.py --model alexnet_qtcl --qtcl-alpha 0.7 --output-dir results/alexnet_qtcl_alpha0.7
-
-# QTCL (two replacements)
-python script/exp/alexnet_cifar100.py --model alexnet_qtcl12 --qtcl-alpha 0.6 --output-dir results/alexnet_qtcl12_alpha0.6
-python script/exp/alexnet_cifar100.py --model alexnet_qtcl12 --qtcl-alpha 0.9 --output-dir results/alexnet_qtcl12_alpha0.9
+python -m src.qtcl.ansatz
+python -m script.exp.alexnet_cifar100 --help
+python -m script.exp.vgg19_cifar100 --help
 ```
 
-### VGG19 Runs
+The ansatz module is a standalone circuit sanity check. The repository currently has no automated unit-test suite; use quick-start training to check the QTCL workflow. The checkpoint-evaluation limitation is described above.
 
-```bash
-# Baseline (not yet present in current results folder, but supported)
-python script/exp/vgg19_cifar100.py --model vgg19 --output-dir results/vgg19
+## Citation
 
-# TCL
-python script/exp/vgg19_cifar100.py --model vgg19_tcl --output-dir results/vgg19_tcl
-python script/exp/vgg19_cifar100.py --model vgg19_tcl12 --output-dir results/vgg19_tcl12
-
-# QTCL (single replacement)
-python script/exp/vgg19_cifar100.py --model vgg19_qtcl --qtcl-alpha 0.5 --output-dir results/vgg19_qtcl_alpha0.5
-python script/exp/vgg19_cifar100.py --model vgg19_qtcl --qtcl-alpha 0.6 --output-dir results/vgg19_qtcl_alpha0.6
-
-# QTCL (two replacements)
-python script/exp/vgg19_cifar100.py --model vgg19_qtcl12 --qtcl-alpha 0.4 --output-dir results/vgg19_qtcl12_alpha0.4
-python script/exp/vgg19_cifar100.py --model vgg19_qtcl12 --qtcl-alpha 0.5 --output-dir results/vgg19_qtcl12_alpha0.5
+```bibtex
+@inproceedings{10.1117/12.3098024,
+author = {Van Tien Nguyen and Panagiotis (Panos) Markopoulos},
+title = {{Quantum-based tensor contraction layers}},
+volume = {14030},
+booktitle = {Machine Learning from Challenging Data 2026},
+editor = {Panagiotis  (Panos) Markopoulos and George Sklivanitis and Bing Ouyang},
+organization = {International Society for Optics and Photonics},
+publisher = {SPIE},
+pages = {140300I},
+keywords = {quantum , machine learning, tensors},
+year = {2026},
+doi = {10.1117/12.3098024},
+URL = {https://doi.org/10.1117/12.3098024}
+}
 ```
 
-### Multi-GPU (DDP via torchrun)
+## Contact
 
-Scripts automatically enable distributed mode when `RANK` and `WORLD_SIZE` are set by `torchrun`.
+**Van Tien Nguyen**
 
-```bash
-torchrun --standalone --nproc_per_node=2 script/exp/alexnet_cifar100.py \
-  --model alexnet_qtcl12 --qtcl-alpha 0.6 \
-  --output-dir results/alexnet_qtcl12_alpha0.6
-```
+[tien.nguyen@utsa.edu](mailto:tien.nguyen@utsa.edu) · [vantn.prof@gmail.com](mailto:vantn.prof@gmail.com)
 
-## Key Training Settings
-
-| Setting | AlexNet script | VGG19 script |
-|---|---|---|
-| Epochs | 160 | 160 |
-| Batch size | 128 train / 256 val | 128 train / 256 val |
-| Backbone optimizer | SGD (lr=0.01, momentum=0.9, weight_decay=1e-4) | SGD (lr=0.01, momentum=0.9, weight_decay=1e-4) |
-| Quantum optimizer (if QTCL exists) | AdamW (lr=5e-3, betas=(0.9,0.999), wd=1e-4) | AdamW (lr=5e-3, betas=(0.9,0.999), wd=1e-4) |
-| LR scheduler | StepLR(step_size=30, gamma=0.1) | StepLR(step_size=40, gamma=0.1) |
-| Loss | CrossEntropyLoss | CrossEntropyLoss |
-
-## QTCL Configuration
-
-Main QTCL controls:
-- `--qtcl-n-qubits` (default: `8`)
-- `--qtcl-n-layers` (default: `2`)
-- `--qtcl-F` (latent quantum feature width, default: `n_qubits`)
-- `--qtcl-alpha` in `[0,1]` (classical/quantum interpolation weight)
-- `--qtcl-learnable-alpha` (make alpha trainable)
-- `--qtcl-shots` (`0` means analytic expectation)
-- `--qtcl-ansatz` in `{HEA, SLE, QAOA, MPS, MERA}`
-- `--qtcl-ansatz-kwargs` as JSON string
-- `--freeze-backbone-epochs` to warm up QTCL while freezing backbone SGD updates
-
-Second QTCL stage (`*_qtcl12`) overrides:
-- `--qtcl2-n-qubits`, `--qtcl2-n-layers`, `--qtcl2-F`
-- `--qtcl2-alpha`, `--qtcl2-learnable-alpha`
-- `--qtcl2-shots`, `--qtcl2-ansatz`, `--qtcl2-ansatz-kwargs`
-
-Note:
-- `--qtcl-batchnorm` is used in the two-stage QTCL path (`*_qtcl12`).
-- Single-stage QTCL replacement (`*_qtcl1`) currently injects BatchNorm in script logic.
-
-## Output Artifacts
-
-Each run writes to `--output-dir`:
-- `training_log.csv`: per-epoch train/val loss and accuracy
-- `training_summary.csv`: best/final metrics summary
-- `training_curves.png`: loss and accuracy curves
-- `checkpoint_best_acc.pth`: best validation-accuracy checkpoint
-- `run.log`: real-time mirror of console output (written automatically by the script)
-
-## Current Results Snapshot
-
-From `results/*/training_summary.csv`:
-
-Note: these are repository snapshot runs and may use different hardware/process counts; use the command sections above for controlled re-runs.
-
-| Experiment | Best Val Acc (%) | Best Epoch | Best Val Loss |
-|---|---:|---:|---:|
-| alexnet | 65.70 | 79 | 1.3855 |
-| alexnet_qtcl12_alpha0.6 | 57.92 | 80 | 1.7177 |
-| alexnet_qtcl12_alpha0.9 | 57.89 | 62 | 1.7975 |
-| alexnet_qtcl_alpha0.6 | 63.53 | 67 | 1.4396 |
-| alexnet_qtcl_alpha0.7 | 63.39 | 73 | 1.4440 |
-| alexnet_tcl | 66.56 | 88 | 1.2951 |
-| alexnet_tcl12 | 65.69 | 65 | 1.3334 |
-| vgg19_qtcl12_alpha0.4 | 71.02 | 152 | 1.4282 |
-| vgg19_qtcl12_alpha0.5 | 71.67 | 99 | 1.3850 |
-| vgg19_qtcl_alpha0.5 | 71.28 | 139 | 1.3812 |
-| vgg19_qtcl_alpha0.6 | 71.47 | 130 | 1.3633 |
-| vgg19_tcl | 71.83 | 53 | 1.3042 |
-| vgg19_tcl12 | 67.48 | 158 | 1.4580 |
-
-
-
-Contact information: vantn.prof@gmail.com
+[Personal website](https://vantnprof.github.io)
